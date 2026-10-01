@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video Translator & Dubbing</title>
+<link rel="stylesheet" href="/static/style.css?v=12">
+</head>
+<body>
+<div class="app" id="app">
+  <header>
+    <h1>Video Translator &amp; Dubbing</h1>
+    <button id="btnSettings" class="btn secondary">Cấu hình LLM</button>
+  </header>
+
+  <main>
+    <details class="card acc-card setup-acc" open>
+      <summary><h2>1. Tải video lên</h2></summary>
+      <input type="file" id="videoFile" accept="video/*">
+      <label>Ngôn ngữ gốc (để trống = tự nhận diện)</label>
+      <input type="text" id="sourceLang" placeholder="vd: en, vi, ja...">
+      <label>Ngữ cảnh nội dung (tuỳ chọn, giúp dịch chính xác hơn)</label>
+      <input type="text" id="context" placeholder="vd: video hướng dẫn nấu ăn, cuộc phỏng vấn công nghệ...">
+    </details>
+
+    <details class="card acc-card setup-acc" open>
+      <summary><h2>2. Ngôn ngữ đích</h2></summary>
+      <div id="langList" class="chips"></div>
+      <input type="text" id="customLang" placeholder="Thêm mã ngôn ngữ, vd: vi, en, ja, ko...">
+      <button id="btnAddLang" class="btn secondary">Thêm</button>
+    </details>
+
+    <details class="card acc-card setup-acc" open>
+      <summary><h2>3. Chế độ đầu ra</h2></summary>
+      <div class="radio-group">
+        <label><input type="radio" name="mode" value="subtitle_burn" checked> Gắn phụ đề cứng vào video (burn-in)</label>
+        <label><input type="radio" name="mode" value="subtitle_soft"> Gắn phụ đề mềm (có thể bật/tắt) + xuất SRT</label>
+      </div>
+      <p class="hint">Lồng tiếng thay thế audio gốc là tuỳ chọn, bật được ở bước chỉnh sửa với cả hai chế độ trên.</p>
+    </details>
+
+    <button id="btnStart" class="btn primary">Bắt đầu xử lý</button>
+
+    <section class="card" id="jobSection" style="display:none">
+      <h2>Tiến trình</h2>
+      <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+      <p id="jobMessage"></p>
+      <div id="uploadStats" class="upload-stats" style="display:none">
+        <span id="upPercent">0%</span>
+        <span id="upSpeed">–</span>
+        <span id="upEta">–</span>
+        <span id="upBytes">–</span>
+        <button id="btnCancelUpload" class="mini danger" type="button">Hủy tải lên</button>
+      </div>
+    </section>
+
+    <!-- ===== Trình chỉnh sửa phụ đề ===== -->
+    <section class="card editor" id="reviewSection" style="display:none">
+      <div class="editor-top">
+        <h2>4. Chỉnh sửa phụ đề</h2>
+        <div id="reviewTabs" class="chips"></div>
+      </div>
+
+      <div class="editor-main">
+        <div class="preview-pane">
+          <div class="video-wrap">
+            <video id="editorVideo" controls playsinline preload="metadata"></video>
+            <div id="regionLayer" class="region-layer">
+              <div id="subOverlay" class="sub-overlay"></div>
+              <div id="wmOverlay" class="wm-overlay"></div>
+            </div>
+          </div>
+          <div class="video-meta">
+            <span id="timeLabel">00:00.000 / 00:00.000</span>
+            <span id="cutInfo" class="cut-info"></span>
+            <span id="videoNote"></span>
+          </div>
+
+          <!-- Thanh công cụ + timeline: nằm sát ngay dưới video -->
+          <div class="toolbar" role="toolbar" aria-label="Công cụ chỉnh sửa">
+            <div class="tool-group">
+              <button id="btnUndo" class="tool" title="Hoàn tác (Ctrl+Z) – gồm cả phụ đề và đoạn cắt">Hoàn tác</button>
+              <button id="btnRedo" class="tool" title="Làm lại (Ctrl+Y)">Làm lại</button>
+            </div>
+            <span class="tool-sep"></span>
+            <div class="tool-group">
+              <button id="btnSplit" class="tool accent" title="Tách đoạn phụ đề tại đầu phát và con trỏ (S hoặc Ctrl+B)">Tách</button>
+              <button id="btnMerge" class="tool" title="Gộp đoạn phụ đề đang chọn với đoạn sau nó">Gộp</button>
+              <button id="btnAdd" class="tool" title="Thêm đoạn phụ đề mới tại đầu phát">Thêm</button>
+              <button id="btnDelete" class="tool danger" title="Xóa đoạn phụ đề đang chọn (Delete)">Xóa</button>
+            </div>
+            <span class="tool-sep"></span>
+            <div class="tool-group">
+              <button id="btnMarkIn" class="tool" title="Đặt điểm bắt đầu đoạn cắt tại đầu phát (I)">Vào (I)</button>
+              <button id="btnMarkOut" class="tool" title="Đặt điểm kết thúc đoạn cắt tại đầu phát (O)">Ra (O)</button>
+              <button id="btnCutRange" class="tool cut" title="Cắt bỏ đoạn từ điểm vào đến điểm ra (hoặc đến đầu phát) (X)">Cắt (X)</button>
+              <button id="btnCutSeg" class="tool cut" title="Cắt bỏ đúng khoảng thời gian của đoạn phụ đề đang chọn">Cắt theo phụ đề</button>
+            </div>
+            <span class="tool-spacer"></span>
+            <label class="zoom" for="zoom">Thu phóng
+              <input type="range" id="zoom" min="20" max="300" value="80">
+            </label>
+          </div>
+
+          <div class="timeline-area">
+            <div class="tl-labels">
+              <div class="r-ruler"></div>
+              <div class="r-cut">Cắt</div>
+              <div class="r-src">Gốc</div>
+              <div class="r-main">Dịch</div>
+            </div>
+            <div class="tl-scroll" id="timelineScroll">
+              <div class="timeline" id="timeline">
+                <div class="tl-ruler" id="tlRuler"></div>
+                <div class="tl-cuts" id="tlCuts"></div>
+                <div class="tl-src" id="tlSrc"></div>
+                <div class="tl-track" id="tlTrack"></div>
+                <div class="playhead" id="playhead"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Các tính năng: mục đóng/mở -->
+          <div class="panels" id="editorPanels">
+            <div class="panels-head">
+              <span class="muted">Công cụ nâng cao</span>
+              <button id="btnAccAll" class="mini" type="button">Mở tất cả</button>
+            </div>
+
+            <details class="acc" id="accCuts" data-persist open>
+              <summary><span class="acc-title">Cắt video</span><span id="cutBadge" class="acc-badge"></span></summary>
+              <div class="acc-body">
+                <label class="wm-switch"><input type="checkbox" id="cutSkip" checked> Khi xem thử, tự nhảy qua các đoạn đã cắt</label>
+                <div id="cutList"></div>
+                <div class="row cut-actions">
+                  <button id="btnClearCuts" class="mini danger" type="button">Bỏ tất cả đoạn cắt</button>
+                </div>
+                <p class="hint">Kéo chuột trên làn “Cắt” của timeline để chọn đoạn cần bỏ. Kéo mép hoặc thân khối đỏ để chỉnh; chọn khối rồi bấm <kbd>Delete</kbd> để bỏ cắt. Hoặc đặt đầu phát rồi bấm <kbd>I</kbd> (vào), <kbd>O</kbd> (ra), <kbd>X</kbd> (cắt). Hoàn tác/Làm lại hoạt động với cả đoạn cắt. Phụ đề và giọng lồng tiếng tự dồn theo video khi xuất.</p>
+              </div>
+            </details>
+
+            <details class="acc" id="dubPanel" data-persist open style="display:none">
+              <summary><span class="acc-title">Audio lồng tiếng</span><span id="dubBadge" class="dub-badge idle">Chưa tạo</span></summary>
+              <div class="acc-body">
+                <div class="row voice-row">
+                  <label for="dubVoice">Giọng đọc</label>
+                  <select id="dubVoice" aria-label="Chọn giọng đọc lồng tiếng"></select>
+                  <button id="btnVoicePreview" class="tool" type="button" title="Nghe thử giọng đang chọn bằng câu đầu tiên của phụ đề">▶ Nghe thử</button>
+                </div>
+                <p class="muted voice-msg" id="voiceMsg"></p>
+                <div class="row dub-row">
+                  <button id="btnDubBuild" class="tool accent" type="button">Tạo giọng lồng tiếng</button>
+                  <div class="dub-source" role="radiogroup" aria-label="Nguồn audio">
+                    <label><input type="radio" name="dubSource" value="orig" checked> Audio gốc</label>
+                    <label><input type="radio" name="dubSource" value="dub"> Audio lồng tiếng</label>
+                  </div>
+                </div>
+                <div class="progress-bar dub-progress" id="dubProgressWrap" style="display:none"><div id="dubProgressFill" class="progress-fill"></div></div>
+                <div class="dub-mix" id="dubMix">
+                  <div class="row wm-row">
+                    <label for="dubOrigVolume">Âm gốc</label>
+                    <input type="range" id="dubOrigVolume" min="0" max="100" value="25">
+                    <span id="dubOrigVolumeVal" class="muted">25%</span>
+                  </div>
+                  <div class="row wm-row">
+                    <label for="dubVolume">Giọng đọc</label>
+                    <input type="range" id="dubVolume" min="0" max="100" value="100">
+                    <span id="dubVolumeVal" class="muted">100%</span>
+                  </div>
+                  <label class="wm-switch dub-duck"><input type="checkbox" id="dubDuck" checked> Tự động hạ âm gốc khi có giọng đọc</label>
+                  <div class="row wm-row">
+                    <label for="dubDuckLevel">Hạ còn</label>
+                    <input type="range" id="dubDuckLevel" min="0" max="100" value="30">
+                    <span id="dubDuckLevelVal" class="muted">30%</span>
+                  </div>
+                </div>
+                <p class="muted dub-engine" id="dubEngine"></p>
+                <p class="hint" id="dubHint"></p>
+                <audio id="dubAudio" preload="auto"></audio>
+              </div>
+            </details>
+
+            <details class="acc" id="accSubStyle" data-persist>
+              <summary><span class="acc-title">Cỡ chữ &amp; vị trí phụ đề</span></summary>
+              <div class="acc-body">
+                <div class="regions-head">
+                  <button id="btnMoveSub" class="tool" type="button">Di chuyển phụ đề</button>
+                </div>
+                <div class="row subtitle-size-row">
+                  <label for="subFontSize" class="muted" style="margin:0;">Cỡ chữ</label>
+                  <input type="range" id="subFontSize" min="10" max="80" value="28">
+                  <span id="subFontSizeVal" class="muted">28</span>
+                </div>
+                <p class="hint">Bấm “Di chuyển phụ đề”, rồi kéo dòng chữ trên video tới vị trí mong muốn. Bấm “Xong” khi hoàn tất. Cỡ chữ và vị trí sẽ được áp dụng khi gắn phụ đề cứng vào video.</p>
+              </div>
+            </details>
+
+            <details class="acc" id="accWatermark" data-persist>
+              <summary><span class="acc-title">Hình mờ chống sao chép (logo / chữ)</span><span id="wmBadge" class="acc-badge"></span></summary>
+              <div class="acc-body">
+                <div class="regions-head">
+                  <label class="wm-switch"><input type="checkbox" id="wmEnabled"> Bật</label>
+                  <button id="btnMoveWm" class="tool" type="button">Di chuyển hình mờ</button>
+                </div>
+
+                <div id="wmBody">
+                  <div class="wm-types">
+                    <label><input type="radio" name="wmType" value="text" checked> Chữ</label>
+                    <label><input type="radio" name="wmType" value="image"> Ảnh / logo</label>
+                  </div>
+
+                  <div id="wmTextRow">
+                    <input type="text" id="wmText" maxlength="200" placeholder="vd: @tenkenh của bạn">
+                    <div class="row wm-row">
+                      <label for="wmFontSize">Cỡ chữ</label>
+                      <input type="range" id="wmFontSize" min="8" max="200" value="24">
+                      <span id="wmFontSizeVal" class="muted">24</span>
+                    </div>
+                  </div>
+
+                  <div id="wmImageRow" style="display:none">
+                    <input type="file" id="wmImage" accept="image/png,image/jpeg,image/webp">
+                    <div class="row wm-row">
+                      <label for="wmScale">Kích thước</label>
+                      <input type="range" id="wmScale" min="2" max="100" value="16">
+                      <span id="wmScaleVal" class="muted">16%</span>
+                    </div>
+                  </div>
+
+                  <div class="row wm-row">
+                    <label for="wmOpacity">Độ mờ</label>
+                    <input type="range" id="wmOpacity" min="2" max="100" value="50">
+                    <span id="wmOpacityVal" class="muted">50%</span>
+                  </div>
+                </div>
+                <p class="hint">Bật hình mờ, chọn chữ hoặc ảnh, rồi bấm “Di chuyển hình mờ” và kéo trực tiếp trên video tới vị trí mong muốn. Ảnh nên là PNG nền trong suốt. Hình mờ được đóng vào video một lần trước khi gắn phụ đề/lồng tiếng, áp dụng cho mọi ngôn ngữ.</p>
+              </div>
+            </details>
+
+            <details class="acc" id="accRegions" data-persist>
+              <summary><span class="acc-title">Che / xóa logo và phụ đề cũ</span><span id="regionBadge" class="acc-badge"></span></summary>
+              <div class="acc-body">
+                <div class="regions-head">
+                  <select id="regionMode" aria-label="Kiểu xử lý cho vùng mới">
+                    <option value="blur">Làm mờ</option>
+                    <option value="box">Che đặc (đen)</option>
+                    <option value="delogo">Xóa logo (nội suy)</option>
+                  </select>
+                  <button id="btnDrawRegion" class="tool">Vẽ vùng</button>
+                </div>
+                <div id="regionList"></div>
+                <p class="hint">Bấm “Vẽ vùng”, kéo một khung trên video quanh logo hoặc dòng phụ đề cũ, rồi bấm “Xong”. Vùng áp dụng cho cả video khi xuất và được xử lý trước khi gắn phụ đề mới.</p>
+              </div>
+            </details>
+
+            <details class="acc" id="accKeys" data-persist>
+              <summary><span class="acc-title">Phím tắt &amp; hướng dẫn</span></summary>
+              <div class="acc-body">
+                <p class="hint" style="margin-top:4px">
+                  <kbd>Space</kbd> phát/dừng · <kbd>←</kbd>/<kbd>→</kbd> lùi/tiến 0,1 giây (giữ <kbd>Shift</kbd> = 1 giây) ·
+                  <kbd>S</kbd> tách đoạn phụ đề · <kbd>I</kbd>/<kbd>O</kbd>/<kbd>X</kbd> vào/ra/cắt video ·
+                  <kbd>Delete</kbd> xóa đoạn đang chọn · <kbd>Ctrl</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd> hoàn tác/làm lại ·
+                  <kbd>Ctrl</kbd>+<kbd>S</kbd> lưu · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> trong ô chữ để tách tại con trỏ.
+                  Kéo cạnh khối phụ đề trên timeline để đổi thời gian, kéo cả khối để dời. Đoạn phụ đề để trống sẽ bị bỏ khi lưu.
+                </p>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div class="list-pane">
+          <div id="reviewList"></div>
+        </div>
+      </div>
+
+      <div class="editor-foot">
+        <span id="editorStatus" role="status"></span>
+        <div class="foot-actions">
+          <button id="btnSaveEdits" class="btn secondary">Lưu thay đổi</button>
+          <button id="btnCloseEditor" class="btn secondary">Đóng</button>
+          <button id="btnExport" class="btn primary">Xuất video &amp; SRT</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="resultSection" style="display:none">
+      <h2>Kết quả</h2>
+      <div id="jobResults"></div>
+      <button id="btnReedit" class="btn secondary">Chỉnh sửa lại phụ đề</button>
+    </section>
+
+    <details class="card acc-card" id="accHistory" data-persist open>
+      <summary><h2>Lịch sử job</h2></summary>
+      <div id="jobHistory"></div>
+    </details>
+  </main>
+</div>
+
+<div id="settingsModal" class="modal">
+  <div class="modal-content">
+    <h2>Cấu hình LLM (chuẩn OpenAI API)</h2>
+    <label>Base URL</label>
+    <input type="text" id="cfgBaseUrl" placeholder="https://api.openai.com/v1">
+    <label>API Key</label>
+    <input type="password" id="cfgApiKey" placeholder="sk-...">
+    <label>Model</label>
+    <div class="row">
+      <input type="text" id="cfgModel" placeholder="gpt-4o-mini" list="modelList">
+      <datalist id="modelList"></datalist>
+      <button id="btnFetchModels" class="btn secondary">Lấy danh sách</button>
+    </div>
+    <label>Temperature</label>
+    <input type="number" id="cfgTemperature" step="0.1" min="0" max="2" value="0.3">
+    <label><input type="checkbox" id="cfgJsonMode" checked> Provider hỗ trợ JSON mode</label>
+    <div class="row">
+      <button id="btnTestConn" class="btn secondary">Kiểm tra kết nối</button>
+      <span id="testResult"></span>
+    </div>
+    <div class="row modal-actions">
+      <button id="btnCloseSettings" class="btn secondary">Đóng</button>
+      <button id="btnSaveSettings" class="btn primary">Lưu cấu hình</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js?v=12"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  video-translator:
+    build: .
+    image: video-translator:latest
+    container_name: video-translator
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./video_translator_data:/data
+    environment:
+      - WHISPER_MODEL_SIZE=medium
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - MAX_UPLOAD_SIZE_MB=2048
+    restart: unless-stopped
+
