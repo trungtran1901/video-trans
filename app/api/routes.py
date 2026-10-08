@@ -11,8 +11,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.config import UPLOAD_DIR, OUTPUT_DIR
 from app.core.llm_config import load_config, save_config, LLMConfig
 from app.core.llm_client import LLMClient
-from app.core import jobstore, dubbing, composition, media as media_lib, translator, asr
-from app.core.pipeline import transcribe_and_translate, render_job, prepare_media, translate_media
+from app.core import jobstore, dubbing, composition, media as media_lib
+from app.core.pipeline import (transcribe_and_translate, render_job, prepare_media, translate_media,
+                               retranslate_job)
 
 router = APIRouter()
 
@@ -788,6 +789,9 @@ def _norm_text(t) -> str:
     return " ".join(str(t or "").split()).lower()
 
 
+_retr_lock = threading.Lock()
+
+
 def _source_texts(job) -> set:
     """Mọi câu gốc (video chính + clip thêm) – đoạn nào còn giống hệt câu gốc là chưa được dịch."""
     texts = {_norm_text(s["text"]) for s in (job.segments or {}).get("_source", [])}
@@ -823,30 +827,21 @@ def retranslate(job_id: str, payload: dict | None = None):
     only_missing = not bool(payload.get("all", False))
 
     src = _source_texts(job)
-    client = LLMClient(load_config())
-    results, total_failed, last_error = {}, 0, ""
-
+    plan = {}
     for lang in langs:
-        segs = [dict(s) for s in job.segments[lang]]
-        idxs = [i for i, s in enumerate(segs) if not only_missing or _norm_text(s["text"]) in src]
-        if not idxs:
-            results[lang] = {"translated": 0, "failed": 0}
-            continue
-        items = [asr.Segment(id=n, start=float(segs[i]["start"]), end=float(segs[i]["end"]),
-                             text=str(segs[i]["text"])) for n, i in enumerate(idxs)]
-        stats: dict = {}
-        out = translator.translate_all(client, items, lang, context=job.context, stats=stats)
-        failed = int(stats.get("failed", 0))
-        if failed >= len(idxs):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Không kết nối được mô hình AI ({lang}): {stats.get('error') or 'không rõ lỗi'}",
-            )
-        for n, i in enumerate(idxs):
-            segs[i]["text"] = out[n]["text"]
-        jobstore.set_segments_for_lang(job_id, lang, segs)
-        results[lang] = {"translated": len(idxs) - failed, "failed": failed}
-        total_failed += failed
-        last_error = stats.get("error") or last_error
+        idxs = [i for i, s in enumerate(job.segments[lang])
+                if not only_missing or _norm_text(s["text"]) in src]
+        if idxs:
+            plan[lang] = idxs
 
-    return {"ok": True, "restarted": False, "results": results, "failed": total_failed, "error": last_error}
+    if not plan:
+        return {"ok": True, "queued": False, "restarted": False}
+
+    with _retr_lock:
+        fresh = jobstore.get_job(job_id)
+        if not fresh or fresh.status not in EDIT_STATES:
+            raise HTTPException(status_code=400, detail="job đang xử lý, hãy đợi xong")
+        jobstore.update_job(job_id, status="running", progress=5,
+                            message="Đã xếp hàng dịch lại", error="")
+    threading.Thread(target=retranslate_job, args=(job_id, plan), daemon=True).start()
+    return {"ok": True, "queued": True, "restarted": False}

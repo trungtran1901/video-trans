@@ -1,10 +1,23 @@
 import json
 import re
 import httpx
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError
 from app.core.llm_config import LLMConfig
 
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+MIN_REQUEST_TIMEOUT = 180
+LINE_RE = re.compile(r"^\s*\[?(\d+)\]?\s*[:.\-)\t|]\s*(.+?)\s*$")
+
+
+class LLMFormatError(ValueError):
+    pass
+
+
+def _strip_fences(text) -> str:
+    t = (text or "").strip()
+    t = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", t)
+    t = re.sub(r"\s*```\s*$", "", t)
+    return t.strip()
 
 
 class LLMClient:
@@ -13,7 +26,8 @@ class LLMClient:
         self.client = OpenAI(
             api_key=cfg.api_key or "not-required",
             base_url=cfg.base_url,
-            timeout=cfg.timeout,
+            timeout=max(float(cfg.timeout or 0), MIN_REQUEST_TIMEOUT),
+            max_retries=0,
             default_headers=cfg.extra_headers or {},
         )
 
@@ -57,6 +71,9 @@ class LLMClient:
             return False, str(e)
 
     def _extract_json(self, content: str) -> dict:
+        content = _strip_fences(content)
+        if not content:
+            raise ValueError("LLM response is empty")
         try:
             return json.loads(content)
         except Exception:
@@ -101,8 +118,31 @@ class LLMClient:
         resp = self.client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content
 
+    def _chat_json_first(self, system_prompt: str, user_prompt: str) -> str:
+        try:
+            return self._chat(system_prompt, user_prompt, force_json=True)
+        except APITimeoutError:
+            raise
+        except Exception:
+            return self._chat(system_prompt, user_prompt, force_json=False)
+
+    @staticmethod
+    def _by_id_from_json(content: str, extract) -> dict:
+        data = extract(content)
+        result = data.get("segments", []) if isinstance(data, dict) else []
+        return {int(s["id"]): s["text"] for s in result if "id" in s and "text" in s}
+
+    @staticmethod
+    def _by_id_from_lines(content: str) -> dict:
+        found = {}
+        for line in _strip_fences(content).splitlines():
+            m = LINE_RE.match(line)
+            if m:
+                found[int(m.group(1))] = m.group(2)
+        return found
+
     def translate_segments(self, segments: list[dict], target_lang: str, context: str = "") -> list[dict]:
-        system_prompt = (
+        base = (
             f"You are a professional native-level subtitle translator. Translate the following dialogue "
             f"segments into {target_lang}. Each segment is a separate subtitle line tied to a specific "
             f"moment in the video, so translate EACH segment independently and keep its meaning strictly "
@@ -111,17 +151,41 @@ class LLMClient:
             f"language as native speakers would say it, not literal word-for-word translation, but stay "
             f"faithful to what is said in that exact segment. Keep the exact same number of segments and "
             f"the same ids. Context/topic of the video: {context or 'general'}. "
+        )
+        json_prompt = base + (
             'Respond ONLY with strict JSON in this exact shape: '
             '{"segments": [{"id": <int>, "text": "<translated text>"}]}'
         )
-        user_prompt = json.dumps({"segments": segments}, ensure_ascii=False)
-        try:
-            content = self._chat(system_prompt, user_prompt, force_json=True)
-        except Exception:
-            content = self._chat(system_prompt, user_prompt, force_json=False)
-        data = self._extract_json(content)
-        result = data.get("segments", [])
-        by_id = {int(s["id"]): s["text"] for s in result if "id" in s and "text" in s}
+        line_prompt = base + (
+            'Respond ONLY with one line per segment, in the form: <id>: <translated text>. '
+            'No JSON, no markdown, no explanations.'
+        )
+        json_user = json.dumps({"segments": segments}, ensure_ascii=False)
+        line_user = "\n".join(f"{s['id']}: {s['text']}" for s in segments)
+
+        by_id: dict = {}
+        last = ""
+        for force_json in (True, False):
+            try:
+                last = self._chat(json_prompt, json_user, force_json=force_json)
+                by_id = self._by_id_from_json(last, self._extract_json)
+            except APITimeoutError:
+                raise
+            except Exception:
+                by_id = {}
+            if by_id:
+                break
+        if not by_id:
+            try:
+                last = self._chat(line_prompt, line_user, force_json=False)
+            except APITimeoutError:
+                raise
+            except Exception as e:
+                raise LLMFormatError(f"LLM request failed: {e}")
+            by_id = self._by_id_from_lines(last)
+        if not by_id:
+            raise LLMFormatError(f"LLM response is not usable: {_strip_fences(last)[:200]!r}")
+
         output = []
         for seg in segments:
             sid = int(seg["id"])
@@ -138,10 +202,7 @@ class LLMClient:
             'Respond ONLY with strict JSON: {"segments": [{"id": <int>, "text": "<text>"}]}'
         )
         user_prompt = json.dumps({"segments": segments}, ensure_ascii=False)
-        try:
-            content = self._chat(system_prompt, user_prompt, force_json=True)
-        except Exception:
-            content = self._chat(system_prompt, user_prompt, force_json=False)
+        content = self._chat_json_first(system_prompt, user_prompt)
         data = self._extract_json(content)
         result = data.get("segments", [])
         by_id = {int(s["id"]): s["text"] for s in result if "id" in s and "text" in s}

@@ -63,11 +63,25 @@ def transcribe_and_translate(job_id: str, video_path: Path, target_langs: list[s
 
         for lang in target_langs:
             jobstore.update_job(job_id, progress=step_progress, message=f"Translating to {lang}")
+            current = {s.id: {"id": s.id, "start": s.start, "end": s.end, "text": s.text} for s in segments}
+            jobstore.set_segments_for_lang(job_id, lang, list(current.values()))
+
+            def save_batch(items, failed, current=current, lang=lang):
+                for it in items:
+                    if it["id"] not in failed:
+                        current[it["id"]]["text"] = it["text"]
+                jobstore.set_segments_for_lang(job_id, lang, list(current.values()))
+
+            def prog(done, total, lang=lang, base=step_progress):
+                jobstore.update_job(
+                    job_id, progress=base + int(step_size * done / max(1, total)),
+                    message=f"Translating to {lang}: {done}/{total}")
+
             stats = {}
-            translated_segments = translator.translate_all(client, segments, lang, context=context, stats=stats)
+            translator.translate_all(client, segments, lang, context=context, stats=stats,
+                                     progress_cb=prog, batch_cb=save_batch)
             failed_total += stats.get("failed", 0)
             last_error = stats.get("error") or last_error
-            jobstore.set_segments_for_lang(job_id, lang, translated_segments)
             step_progress += step_size
 
         jobstore.update_job(job_id, progress=88, message="Preparing preview")
@@ -81,6 +95,61 @@ def transcribe_and_translate(job_id: str, video_path: Path, target_langs: list[s
 
     except Exception as e:
         jobstore.update_job(job_id, status="failed", error=str(e), message="Failed")
+
+
+def retranslate_job(job_id: str, plan: dict):
+    total = sum(len(v) for v in plan.values()) or 1
+    done_base, failed_total, last_error, translated_total = 0, 0, "", 0
+    try:
+        client = LLMClient(load_config())
+        for lang, idxs in plan.items():
+            job = jobstore.get_job(job_id)
+            if not job:
+                return
+            segs = [dict(s) for s in (job.segments or {}).get(lang, [])]
+            idxs = [i for i in idxs if i < len(segs)]
+            if not idxs:
+                continue
+            sent = {n: (i, segs[i]["text"]) for n, i in enumerate(idxs)}
+            items = [asr.Segment(id=n, start=float(segs[i]["start"]), end=float(segs[i]["end"]),
+                                 text=str(segs[i]["text"])) for n, i in enumerate(idxs)]
+            saved = {"n": 0}
+
+            def save_batch(batch, failed, lang=lang, sent=sent, saved=saved):
+                fresh = jobstore.get_job(job_id)
+                if not fresh:
+                    return
+                cur = [dict(s) for s in (fresh.segments or {}).get(lang, [])]
+                for it in batch:
+                    if it["id"] in failed:
+                        continue
+                    i, original = sent[it["id"]]
+                    if i < len(cur) and cur[i]["text"] == original:
+                        cur[i]["text"] = it["text"]
+                        saved["n"] += 1
+                jobstore.set_segments_for_lang(job_id, lang, cur)
+
+            def cb(done, _t, base=done_base, lang=lang):
+                jobstore.update_job(
+                    job_id, progress=5 + int(85 * (base + done) / total),
+                    message=f"Dịch lại {lang}: {base + done}/{total} đoạn")
+
+            stats: dict = {}
+            translator.translate_all(client, items, lang, context=job.context, stats=stats,
+                                     progress_cb=cb, batch_cb=save_batch)
+            failed_total += int(stats.get("failed", 0))
+            last_error = stats.get("error") or last_error
+            translated_total += saved["n"]
+            done_base += len(idxs)
+
+        msg = f"Dịch lại xong {translated_total} đoạn."
+        if failed_total:
+            msg = (f"Dịch lại {translated_total} đoạn, còn {failed_total} đoạn lỗi "
+                   f"({last_error or 'không rõ'}). Kết quả đã được lưu, bấm “Dịch lại” để dịch tiếp phần còn lại.")
+        jobstore.update_job(job_id, status="review", progress=90, message=msg, error="")
+    except Exception as e:
+        jobstore.update_job(job_id, status="review", progress=90,
+                            message=f"Dịch lại lỗi: {str(e)[:300]}", error="")
 
 
 def prepare_media(job_id: str, mid: str):
