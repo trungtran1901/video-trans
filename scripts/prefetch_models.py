@@ -66,6 +66,15 @@ if _orig_load is not None:
 print("TTS model ready.")
 
 print()
+try:
+    from app.core import kokoro_vi
+    print("Downloading Kokoro Vietnamese (onnx, config, all voicepacks)")
+    kokoro_vi.prefetch()
+    print("Kokoro Vietnamese ready.")
+except Exception as exc:
+    print("Bo qua Kokoro Vietnamese:", exc)
+
+print()
 print("Xong. De docker-compose dung lai model nay, dat trong file .env o thu muc goc du an:")
 print(f'  HF_CACHE_DIR={hf_dir}')
 print(f'  TTS_CACHE_DIR={tts_dir}')

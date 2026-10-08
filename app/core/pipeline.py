@@ -2,14 +2,15 @@ import os
 import threading
 from pathlib import Path
 from app.config import OUTPUT_DIR
-from app.core import jobstore, media, asr, translator, subtitles, dubbing, cuts as cutlib
+from app.core import jobstore, media, asr, translator, subtitles, dubbing, composition
 from app.core.llm_client import LLMClient
 from app.core.llm_config import load_config
 
+_asr_lock = threading.Lock()
+
 
 def _make_preview(video_path: Path, preview_path: Path) -> None:
-    """Small H.264 480p copy for the in-browser editor. Failure is non-fatal (falls back to the original)."""
-    tmp = preview_path.with_name("preview.tmp.mp4")
+    tmp = preview_path.with_name(preview_path.stem + ".tmp.mp4")
     try:
         media.run_ffmpeg([
             "-i", str(video_path),
@@ -42,11 +43,12 @@ def transcribe_and_translate(job_id: str, video_path: Path, target_langs: list[s
         media.extract_audio(video_path, audio_path)
 
         jobstore.update_job(job_id, progress=15, message="Transcribing speech")
-        segments, detected_lang = asr.transcribe(audio_path, language=source_lang)
+        with _asr_lock:
+            segments, detected_lang = asr.transcribe(audio_path, language=source_lang)
         total_duration = media.get_duration(video_path)
         jobstore.update_job(job_id, total_duration=total_duration)
+        composition.ensure_timeline(job_id)
 
-        # Keep the original-language segments so the editor can show what was actually said.
         jobstore.set_segments_for_lang(
             job_id, "_source",
             [{"id": s.id, "start": s.start, "end": s.end, "text": s.text} for s in segments],
@@ -78,8 +80,60 @@ def transcribe_and_translate(job_id: str, video_path: Path, target_langs: list[s
         jobstore.update_job(job_id, status="failed", error=str(e), message="Failed")
 
 
+def prepare_media(job_id: str, mid: str):
+    job = jobstore.get_job(job_id)
+    m = (job.media or {}).get(mid) if job else None
+    if not m:
+        return
+    media_dir = OUTPUT_DIR / job_id / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    src = Path(m["path"])
+    try:
+        if m["type"] == "video":
+            preview = media_dir / f"{mid}_preview.mp4"
+            _make_preview(src, preview)
+            jobstore.update_media(job_id, mid, preview=str(preview) if preview.exists() else "")
+        try:
+            prev = jobstore.get_job(job_id).media[mid].get("preview")
+            thumb_src = Path(prev) if prev and Path(prev).exists() else src
+            media.make_thumbnail(thumb_src, media_dir / f"{mid}_thumb.jpg", is_image=m["type"] == "image")
+        except Exception:
+            pass
+        jobstore.update_media(job_id, mid, state="ready")
+    except Exception as e:
+        jobstore.update_media(job_id, mid, state="failed", error=str(e)[:500])
+        return
+    fresh = (jobstore.get_job(job_id).media or {}).get(mid)
+    if fresh and fresh.get("translate") and fresh["type"] == "video" and fresh.get("tstate") in ("none", "failed"):
+        translate_media(job_id, mid)
+
+
+def translate_media(job_id: str, mid: str):
+    job = jobstore.get_job(job_id)
+    m = (job.media or {}).get(mid) if job else None
+    if not m:
+        return
+    try:
+        jobstore.update_media(job_id, mid, tstate="running", tmessage="Đang tách âm thanh", error="")
+        work = OUTPUT_DIR / job_id / "media"
+        work.mkdir(parents=True, exist_ok=True)
+        audio_path = work / f"{mid}_audio.wav"
+        media.extract_audio(Path(m["path"]), audio_path)
+        jobstore.update_media(job_id, mid, tmessage="Đang nhận diện giọng nói")
+        with _asr_lock:
+            segments, _ = asr.transcribe(audio_path, language=job.source_lang or None)
+        result = {"_source": [{"id": s.id, "start": s.start, "end": s.end, "text": s.text} for s in segments]}
+        client = LLMClient(load_config())
+        langs = list(job.target_langs)
+        for i, lang in enumerate(langs):
+            jobstore.update_media(job_id, mid, tmessage=f"Đang dịch {lang} ({i + 1}/{len(langs)})")
+            result[lang] = translator.translate_all(client, segments, lang, context=job.context) if segments else []
+        jobstore.update_media(job_id, mid, segments=result, tstate="done", tmessage="", merged=False)
+    except Exception as e:
+        jobstore.update_media(job_id, mid, tstate="failed", tmessage="", error=str(e)[:500])
+
+
 def _preview_height(job_out_dir: Path, frame_h: int) -> int:
-    """Height of the video the editor shows (preview.mp4 is at most 480p; falls back to the original)."""
     preview = job_out_dir / "preview.mp4"
     if preview.exists():
         try:
@@ -90,15 +144,13 @@ def _preview_height(job_out_dir: Path, frame_h: int) -> int:
 
 
 def render_job(job_id: str):
-    job = jobstore.get_job(job_id)
+    job = composition.ensure_timeline(job_id)
     if not job:
         return
 
     job_out_dir = OUTPUT_DIR / job_id
     video_path = Path(job.video_path)
     mode = job.mode
-    # The dubbed voice is an option on top of any subtitle mode.
-    # "dubbing" is the legacy standalone mode: it now means burn-in subtitles + dubbed voice.
     use_dub = bool((job.dub or {}).get("enabled")) or mode == "dubbing"
     if mode not in ("subtitle_burn", "subtitle_soft"):
         mode = "subtitle_burn"
@@ -107,47 +159,52 @@ def render_job(job_id: str):
         jobstore.update_job(job_id, status="rendering", progress=90, message="Rendering output")
         outputs = {}
 
-        # Font sizes in the editor are pixels of its (<=480p) preview video. Scale them to the real
-        # frame, otherwise the exported subtitles/watermark look much smaller than in the preview.
         _, src_h = media.get_video_size(video_path)
         ref_h = _preview_height(job_out_dir, src_h)
         size_unit = src_h / ref_h if ref_h else 1.0
 
-        # Cut ranges (removed parts of the source timeline).
         source_video = video_path
-        total_duration = job.total_duration or media.get_duration(video_path)
-        cut_list = cutlib.normalize_cuts(job.cuts, total_duration)
-        keep = cutlib.keep_ranges(cut_list, total_duration) if cut_list else None
-        if cut_list and not keep:
-            raise RuntimeError("Đã cắt toàn bộ video, không còn gì để xuất.")
-        out_duration = cutlib.kept_duration(keep) if keep else total_duration
+        clips = job.clips
+        media_map = job.media or {}
+        main_duration = float(job.total_duration or media.get_duration(video_path))
+        out_duration = composition.comp_duration(clips)
+        if out_duration < 0.2:
+            raise RuntimeError("Timeline trống, không còn gì để xuất.")
+        identity = composition.is_identity(clips, main_duration)
 
-        # Cut + blur/cover/delogo + watermark in ONE encode shared by all languages
-        # (fewer generations of re-encoding = better picture).
+        full_ranges = [
+            (s, e) for c, s, e in composition.layout(clips)
+            if media_map[c["media"]]["type"] == "video" and not media_map[c["media"]].get("translate", True)
+        ]
+
         wm = job.watermark if (job.watermark and job.watermark.get("enabled")) else None
-        if keep or job.regions or wm:
-            jobstore.update_job(job_id, message="Cutting / cleaning video")
+        if not identity or job.regions or wm:
+            jobstore.update_job(job_id, message="Composing / cleaning video")
             base = job_out_dir / "base.mp4"
-            if media.prepare_base_video(video_path, base, keep_ranges=keep, regions=job.regions,
-                                        watermark=wm, size_unit=size_unit):
+            if media.prepare_base_video(
+                video_path, base,
+                clips=None if identity else clips, media_map=media_map,
+                regions=job.regions, watermark=wm, size_unit=size_unit,
+            ):
                 video_path = base
 
         step_progress = 90
         step_size = max(1, int(10 / max(1, len(job.target_langs))))
 
         for lang in job.target_langs:
-            translated_segments = job.segments.get(lang)
+            translated_segments = [
+                {**s, "end": min(float(s["end"]), out_duration)}
+                for s in (job.segments.get(lang) or [])
+                if float(s["start"]) < out_duration - 0.05
+            ]
+            translated_segments = [s for s in translated_segments if float(s["end"]) - float(s["start"]) >= 0.05]
             if not translated_segments:
                 continue
-            if cut_list:
-                # subtitles/dubbing follow the shortened timeline
-                translated_segments = cutlib.remap_segments(translated_segments, cut_list)
 
             srt_path = job_out_dir / f"subtitles_{lang}.srt"
             subtitles.write_srt(translated_segments, srt_path)
             lang_outputs = {"srt": srt_path.name}
 
-            # Optional: swap the original audio for the dubbed voice (shares the editor preview's cache).
             lang_video = video_path
             dub_base = None
             if use_dub:
@@ -171,7 +228,7 @@ def render_job(job_id: str):
                 media.mix_audio_track(
                     video_path, dubbed_audio, dub_base,
                     orig_volume=float(mix["orig_volume"]), dub_volume=float(mix["dub_volume"]),
-                    envelope_path=env_path,
+                    envelope_path=env_path, full_ranges=full_ranges,
                 )
                 lang_video = dub_base
 
@@ -200,7 +257,7 @@ def render_job(job_id: str):
             step_progress += step_size
 
         if video_path != source_video:
-            video_path.unlink(missing_ok=True)   # heavy intermediate file
+            video_path.unlink(missing_ok=True)
 
         jobstore.update_job(job_id, status="completed", progress=100, message="Done", outputs=outputs)
 

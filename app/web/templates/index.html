@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Video Translator & Dubbing</title>
-<link rel="stylesheet" href="/static/style.css?v=12">
+<link rel="stylesheet" href="/static/style.css?v=13">
 </head>
 <body>
 <div class="app" id="app">
@@ -63,14 +63,16 @@
 
       <div class="editor-main">
         <div class="preview-pane">
-          <div class="video-wrap">
-            <video id="editorVideo" controls playsinline preload="metadata"></video>
+          <div class="video-wrap" id="videoWrap">
+            <video id="editorVideo" playsinline preload="auto"></video>
+            <img id="clipImage" class="clip-img" alt="">
             <div id="regionLayer" class="region-layer">
               <div id="subOverlay" class="sub-overlay"></div>
               <div id="wmOverlay" class="wm-overlay"></div>
             </div>
           </div>
           <div class="video-meta">
+            <button id="btnPlay" class="tool accent" type="button">Phát</button>
             <span id="timeLabel">00:00.000 / 00:00.000</span>
             <span id="cutInfo" class="cut-info"></span>
             <span id="videoNote"></span>
@@ -91,10 +93,16 @@
             </div>
             <span class="tool-sep"></span>
             <div class="tool-group">
-              <button id="btnMarkIn" class="tool" title="Đặt điểm bắt đầu đoạn cắt tại đầu phát (I)">Vào (I)</button>
-              <button id="btnMarkOut" class="tool" title="Đặt điểm kết thúc đoạn cắt tại đầu phát (O)">Ra (O)</button>
-              <button id="btnCutRange" class="tool cut" title="Cắt bỏ đoạn từ điểm vào đến điểm ra (hoặc đến đầu phát) (X)">Cắt (X)</button>
-              <button id="btnCutSeg" class="tool cut" title="Cắt bỏ đúng khoảng thời gian của đoạn phụ đề đang chọn">Cắt theo phụ đề</button>
+              <button id="btnInsertToolbar" class="tool accent" type="button" title="Thêm video hoặc ảnh vào timeline">+ Video/Ảnh</button>
+              <button id="btnClipSplit" class="tool" type="button" title="Chia clip tại đầu phát (C)">Chia clip</button>
+              <button id="btnClipDelete" class="tool danger" type="button" title="Xóa clip đang chọn (Delete)">Xóa clip</button>
+            </div>
+            <span class="tool-sep"></span>
+            <div class="tool-group">
+              <button id="btnMarkIn" class="tool" title="Đặt điểm vào tại đầu phát (I)">Vào (I)</button>
+              <button id="btnMarkOut" class="tool" title="Đặt điểm ra tại đầu phát (O)">Ra (O)</button>
+              <button id="btnCutRange" class="tool cut" title="Xóa đoạn từ điểm vào đến điểm ra (hoặc đến đầu phát) (X)">Xóa đoạn (X)</button>
+              <button id="btnCutSeg" class="tool cut" title="Xóa đúng khoảng thời gian của đoạn phụ đề đang chọn">Xóa theo phụ đề</button>
             </div>
             <span class="tool-spacer"></span>
             <label class="zoom" for="zoom">Thu phóng
@@ -105,18 +113,44 @@
           <div class="timeline-area">
             <div class="tl-labels">
               <div class="r-ruler"></div>
-              <div class="r-cut">Cắt</div>
+              <div class="r-clip">Clip</div>
               <div class="r-src">Gốc</div>
               <div class="r-main">Dịch</div>
             </div>
             <div class="tl-scroll" id="timelineScroll">
               <div class="timeline" id="timeline">
                 <div class="tl-ruler" id="tlRuler"></div>
-                <div class="tl-cuts" id="tlCuts"></div>
+                <div class="tl-clips" id="tlClips"></div>
                 <div class="tl-src" id="tlSrc"></div>
                 <div class="tl-track" id="tlTrack"></div>
                 <div class="playhead" id="playhead"></div>
               </div>
+            </div>
+          </div>
+
+          <div class="clip-sheet" id="clipSheet" style="display:none">
+            <div class="clip-sheet-head">
+              <strong id="clipTitle"></strong>
+              <span class="tool-group">
+                <button id="btnClipPrev" class="mini" type="button">Dời trước</button>
+                <button id="btnClipNext" class="mini" type="button">Dời sau</button>
+                <button id="btnClipRemove" class="mini danger" type="button">Xóa</button>
+              </span>
+            </div>
+            <div id="clipSpeedBox" class="clip-box">
+              <label>Tốc độ</label>
+              <div id="clipSpeedChips" class="chips"></div>
+              <div class="row wm-row"><input type="range" id="clipSpeed" min="0.25" max="4" step="0.05" value="1"><span id="clipSpeedVal" class="muted">1x</span></div>
+            </div>
+            <div id="clipVolBox" class="clip-box">
+              <div class="row wm-row"><label for="clipVol">Âm lượng</label><input type="range" id="clipVol" min="0" max="200" value="100"><span id="clipVolVal" class="muted">100%</span></div>
+            </div>
+            <div id="clipDurBox" class="clip-box" style="display:none">
+              <div class="row wm-row"><label for="clipDur">Thời lượng</label><input type="range" id="clipDur" min="0.5" max="60" step="0.5" value="3"><span id="clipDurVal" class="muted">3s</span></div>
+            </div>
+            <div id="clipTrBox" class="clip-box">
+              <label class="wm-switch"><input type="checkbox" id="clipTranslate"> Dịch và lồng tiếng đoạn này</label>
+              <p class="muted" id="clipTrStatus"></p>
             </div>
           </div>
 
@@ -127,15 +161,11 @@
               <button id="btnAccAll" class="mini" type="button">Mở tất cả</button>
             </div>
 
-            <details class="acc" id="accCuts" data-persist open>
-              <summary><span class="acc-title">Cắt video</span><span id="cutBadge" class="acc-badge"></span></summary>
+            <details class="acc" id="accClips" data-persist open>
+              <summary><span class="acc-title">Clip &amp; ghép video</span><span id="clipBadge" class="acc-badge"></span></summary>
               <div class="acc-body">
-                <label class="wm-switch"><input type="checkbox" id="cutSkip" checked> Khi xem thử, tự nhảy qua các đoạn đã cắt</label>
-                <div id="cutList"></div>
-                <div class="row cut-actions">
-                  <button id="btnClearCuts" class="mini danger" type="button">Bỏ tất cả đoạn cắt</button>
-                </div>
-                <p class="hint">Kéo chuột trên làn “Cắt” của timeline để chọn đoạn cần bỏ. Kéo mép hoặc thân khối đỏ để chỉnh; chọn khối rồi bấm <kbd>Delete</kbd> để bỏ cắt. Hoặc đặt đầu phát rồi bấm <kbd>I</kbd> (vào), <kbd>O</kbd> (ra), <kbd>X</kbd> (cắt). Hoàn tác/Làm lại hoạt động với cả đoạn cắt. Phụ đề và giọng lồng tiếng tự dồn theo video khi xuất.</p>
+                <div id="clipList"></div>
+                <p class="hint">Bấm “+ Video/Ảnh” hoặc dấu + giữa các clip để thêm; kéo thả tệp từ máy vào timeline cũng được. Kéo thân clip để đổi thứ tự, kéo hai mép để cắt ngắn/dài. Chọn clip để chỉnh tốc độ, âm lượng và bật/tắt dịch. Bấm <kbd>C</kbd> để chia clip tại đầu phát; <kbd>I</kbd>/<kbd>O</kbd>/<kbd>X</kbd> xóa một đoạn. Phụ đề và lồng tiếng tự dời theo clip.</p>
               </div>
             </details>
 
@@ -258,7 +288,7 @@
               <div class="acc-body">
                 <p class="hint" style="margin-top:4px">
                   <kbd>Space</kbd> phát/dừng · <kbd>←</kbd>/<kbd>→</kbd> lùi/tiến 0,1 giây (giữ <kbd>Shift</kbd> = 1 giây) ·
-                  <kbd>S</kbd> tách đoạn phụ đề · <kbd>I</kbd>/<kbd>O</kbd>/<kbd>X</kbd> vào/ra/cắt video ·
+                  <kbd>S</kbd> tách đoạn phụ đề · <kbd>C</kbd> chia clip · <kbd>I</kbd>/<kbd>O</kbd>/<kbd>X</kbd> vào/ra/xóa đoạn ·
                   <kbd>Delete</kbd> xóa đoạn đang chọn · <kbd>Ctrl</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd> hoàn tác/làm lại ·
                   <kbd>Ctrl</kbd>+<kbd>S</kbd> lưu · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> trong ô chữ để tách tại con trỏ.
                   Kéo cạnh khối phụ đề trên timeline để đổi thời gian, kéo cả khối để dời. Đoạn phụ đề để trống sẽ bị bỏ khi lưu.
@@ -296,6 +326,23 @@
   </main>
 </div>
 
+<div id="insertSheet" class="modal">
+  <div class="modal-content">
+    <h2>Thêm video hoặc ảnh</h2>
+    <input type="file" id="insFile" accept="video/*,image/*">
+    <label for="insPos">Vị trí chèn</label>
+    <select id="insPos" class="sel"></select>
+    <label class="wm-switch" id="insTrRow"><input type="checkbox" id="insTranslate" checked> Dịch và lồng tiếng đoạn vừa thêm</label>
+    <div class="row wm-row" id="insDurRow" style="display:none"><label for="insImgDur">Thời lượng ảnh (giây)</label><input type="number" id="insImgDur" value="3" min="0.5" max="600" step="0.5"></div>
+    <div class="progress-bar" id="insProgressWrap" style="display:none"><div id="insProgressFill" class="progress-fill"></div></div>
+    <p class="muted" id="insInfo"></p>
+    <div class="row modal-actions">
+      <button id="btnInsCancel" class="btn secondary" type="button">Đóng</button>
+      <button id="btnInsConfirm" class="btn primary" type="button">Thêm vào timeline</button>
+    </div>
+  </div>
+</div>
+
 <div id="settingsModal" class="modal">
   <div class="modal-content">
     <h2>Cấu hình LLM (chuẩn OpenAI API)</h2>
@@ -323,6 +370,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=12"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>

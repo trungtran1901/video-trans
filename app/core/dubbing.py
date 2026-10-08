@@ -8,6 +8,7 @@ import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from app.config import TTS_MODEL_NAME
+from app.core import kokoro_vi
 from app.core.media import time_stretch, concat_audio_with_silence, get_duration, run_ffmpeg
 
 os.environ.setdefault("COQUI_TOS_AGREED", "1")
@@ -95,7 +96,18 @@ def _voice_kind(voice: str | None) -> tuple[str, str]:
         return "xtts", ""
     if v.startswith("edge:") and len(v) > 5:
         return "edge", v[5:]
+    if v.startswith("kokoro:") and len(v) > 7:
+        return "kokoro", v[7:]
     return "", ""
+
+
+def _is_vi(lang: str) -> bool:
+    return lang.strip().lower().split("-")[0] == "vi"
+
+
+def kokoro_name(voice: str | None = None) -> str:
+    kind, name = _voice_kind(voice)
+    return name if kind == "kokoro" and name else kokoro_vi.DEFAULT_VOICE
 
 
 def pick_engine(lang: str, voice: str | None = None) -> str:
@@ -104,6 +116,8 @@ def pick_engine(lang: str, voice: str | None = None) -> str:
         return kind
     if TTS_ENGINE in ("xtts", "edge"):
         return TTS_ENGINE
+    if _is_vi(lang) and TTS_ENGINE in ("auto", "kokoro") and kokoro_vi.AUTO_FOR_VI and kokoro_vi.is_installed():
+        return "kokoro"
     return "xtts" if _xtts_lang(lang) in XTTS_LANGS else "edge"
 
 
@@ -117,12 +131,18 @@ def edge_voice(lang: str, voice: str | None = None) -> str | None:
 
 def engine_id(lang: str, voice: str | None = None) -> str:
     """Identity of the voice used for `lang`; part of cache keys and of the preview signature."""
-    if pick_engine(lang, voice) == "edge":
+    engine = pick_engine(lang, voice)
+    if engine == "edge":
         return f"edge:{edge_voice(lang, voice)}"
+    if engine == "kokoro":
+        return f"kokoro:{kokoro_name(voice)}"
     return "xtts"
 
 
 def engine_label(lang: str, voice: str | None = None) -> str:
+    if pick_engine(lang, voice) == "kokoro":
+        name = kokoro_name(voice)
+        return f"Kokoro Vietnamese – {kokoro_vi.VOICES.get(name, name)} (chạy trên máy, không cần internet)"
     if pick_engine(lang, voice) == "edge":
         return f"Microsoft Edge – {edge_voice(lang, voice) or 'chưa có giọng cho ngôn ngữ này'} (cần internet, không clone giọng gốc)"
     return "XTTS v2 (clone giọng từ video gốc)"
@@ -244,6 +264,15 @@ def synthesize_segment(text: str, lang: str, output_path: Path, speaker_wav: str
                        voice: str | None = None) -> None:
     if pick_engine(lang, voice) == "edge":
         _synthesize_edge(text, lang, output_path, voice)
+        return
+    if pick_engine(lang, voice) == "kokoro":
+        if not _is_vi(lang):
+            raise RuntimeError(f"Kokoro Vietnamese chỉ hỗ trợ tiếng Việt, không hỗ trợ '{lang}'.")
+        clean = _clean_for_tts(text)
+        if not any(ch.isalnum() for ch in clean):
+            _write_silence(output_path)
+            return
+        kokoro_vi.synthesize_to_file(clean, kokoro_name(voice), output_path)
         return
     tts_lang = _xtts_lang(lang)
     if tts_lang not in XTTS_LANGS:
@@ -406,6 +435,17 @@ def list_voices(lang: str) -> dict:
     prefix = lang.strip().lower().split("-")[0]
     default = edge_voice(lang)
     voices = [{"id": "", "label": "Tự động (mặc định)", "engine": "auto"}]
+    hint = ""
+    kokoro_ok = prefix == "vi" and kokoro_vi.is_installed()
+    kokoro_auto = kokoro_ok and kokoro_vi.AUTO_FOR_VI and TTS_ENGINE in ("auto", "kokoro")
+    if prefix == "vi" and not kokoro_ok:
+        hint = kokoro_vi.INSTALL_HINT
+    if kokoro_ok:
+        for vid, vlabel in kokoro_vi.VOICES.items():
+            label = f"{vlabel} – Kokoro AI (offline)"
+            if vid == kokoro_vi.DEFAULT_VOICE and kokoro_auto:
+                label += " ★ mặc định"
+            voices.append({"id": f"kokoro:{vid}", "label": label, "engine": "kokoro"})
 
     online = True
     try:
@@ -422,7 +462,7 @@ def list_voices(lang: str) -> dict:
         if name.endswith("Neural"):
             name = name[:-6]
         label = f"{name} – {v.get('Gender', '')} – {v.get('Locale', '')}"
-        if short == default:
+        if short == default and not kokoro_auto:
             label += " ★ mặc định"
         edge_items.append({"id": f"edge:{short}", "label": label, "engine": "edge"})
     edge_items.sort(key=lambda x: (0 if "★" in x["label"] else 1, x["label"]))
@@ -432,4 +472,4 @@ def list_voices(lang: str) -> dict:
 
     if _xtts_lang(lang) in XTTS_LANGS:
         voices.append({"id": "xtts", "label": "XTTS v2 – clone giọng người nói trong video (chạy trên máy, chậm)", "engine": "xtts"})
-    return {"voices": voices, "online": online}
+    return {"voices": voices, "online": online, "hint": hint}

@@ -37,6 +37,9 @@ class Job:
         "scale": 0.16,
     })
     dub: dict = field(default_factory=lambda: {"enabled": False, "orig_volume": 0.25, "dub_volume": 1.0, "duck": True, "duck_level": 0.3})  # export with the dubbed voice instead of the original audio
+    source_lang: str = ""
+    clips: list = field(default_factory=list)
+    media: dict = field(default_factory=dict)
     error: str = ""
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -53,7 +56,7 @@ def _save_all(data: dict) -> None:
 
 
 def create_job(input_filename: str, target_langs: list[str], mode: str, job_id: str | None = None,
-               video_path: str = "", context: str = "") -> Job:
+               video_path: str = "", context: str = "", source_lang: str = "") -> Job:
     job = Job(
         id=job_id or str(uuid.uuid4()),
         input_filename=input_filename,
@@ -61,6 +64,7 @@ def create_job(input_filename: str, target_langs: list[str], mode: str, job_id: 
         mode=mode,
         video_path=video_path,
         context=context,
+        source_lang=source_lang,
     )
     with _lock:
         data = _load_all()
@@ -112,3 +116,28 @@ def delete_job(job_id: str) -> bool:
         del data[job_id]
         _save_all(data)
         return True
+
+def add_media(job_id: str, entry: dict) -> None:
+    with _lock:
+        data = _load_all()
+        if job_id not in data:
+            return
+        media = data[job_id].get("media") or {}
+        media[entry["id"]] = entry
+        data[job_id]["media"] = media
+        data[job_id]["updated_at"] = datetime.utcnow().isoformat()
+        _save_all(data)
+
+
+def update_media(job_id: str, mid: str, **kwargs) -> None:
+    with _lock:
+        data = _load_all()
+        job = data.get(job_id)
+        if not job:
+            return
+        entry = (job.get("media") or {}).get(mid)
+        if entry is None:
+            return
+        entry.update(kwargs)
+        job["updated_at"] = datetime.utcnow().isoformat()
+        _save_all(data)

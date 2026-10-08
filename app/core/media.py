@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 from app.config import EXPORT_CRF, EXPORT_PRESET, EXPORT_AUDIO_BITRATE
@@ -70,38 +71,101 @@ def get_video_size(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def prepare_base_video(video_path: Path, output_path: Path, keep_ranges=None, regions=None,
+def get_fps(path: Path) -> float:
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+           "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        raw = out.stdout.decode().strip().splitlines()[0]
+        num, _, den = raw.partition("/")
+        value = float(num) / float(den or 1)
+    except Exception:
+        return 30.0
+    if value <= 0:
+        return 30.0
+    return min(max(value, 1.0), 60.0)
+
+
+def make_thumbnail(src: Path, out: Path, is_image: bool = False, at: float = 0.0) -> None:
+    tmp = out.with_name(out.stem + ".tmp.jpg")
+    args = []
+    if not is_image and at > 0:
+        args += ["-ss", f"{at:.2f}"]
+    args += ["-i", str(src), "-frames:v", "1", "-vf", "scale=-2:120", "-q:v", "4", str(tmp)]
+    run_ffmpeg(args)
+    os.replace(tmp, out)
+
+
+def _atempo_chain(speed: float) -> list[str]:
+    if abs(speed - 1.0) < 1e-3:
+        return []
+    chain = []
+    s = speed
+    while s > 2.0:
+        chain.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5:
+        chain.append("atempo=0.5")
+        s /= 0.5
+    chain.append(f"atempo={s:.4f}")
+    return chain
+
+
+def _even(n: int) -> int:
+    return max(2, n - n % 2)
+
+
+def prepare_base_video(video_path: Path, output_path: Path, clips=None, media_map=None, regions=None,
                        watermark=None, size_unit: float = 1.0) -> bool:
-    """One shared clean-up pass for every language: cut ranges, logo / old-subtitle regions, watermark.
-
-    Everything is done in a single filter graph = a single encode, so the picture is not degraded
-    by several re-encodes in a row.
-
-    keep_ranges: [(start, end), ...] source-timeline seconds that stay (None = keep everything).
-    regions:     [{x, y, w, h, mode}] fractions of the frame; mode "delogo" | "blur" | "box".
-    watermark:   {enabled, type "image"|"text", image, text, opacity, x, y, font_size, scale}.
-    Returns False when there was nothing valid to apply (output_path is then not created).
-    """
     frame_w, frame_h = get_video_size(video_path)
-    audio = has_audio(video_path)
-    inputs = ["-i", str(video_path)]
+    inputs: list[str] = []
     parts: list[str] = []
+    n_inputs = 0
+    audio = has_audio(video_path)
     label = "0:v"
     alabel = None
 
-    # 1) cut: keep only the wanted ranges and join them (sample-accurate trim + concat)
-    if keep_ranges:
-        n = len(keep_ranges)
-        for i, (s, e) in enumerate(keep_ranges):
-            parts.append(f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[cv{i}]")
-            if audio:
-                parts.append(f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[ca{i}]")
-        pads = "".join(f"[cv{i}][ca{i}]" if audio else f"[cv{i}]" for i in range(n))
-        parts.append(f"{pads}concat=n={n}:v=1:a={1 if audio else 0}[vcut]" + ("[acut]" if audio else ""))
-        label = "vcut"
-        alabel = "acut" if audio else None
+    if clips:
+        frame_w, frame_h = _even(frame_w), _even(frame_h)
+        fps = get_fps(video_path)
+        media_map = media_map or {}
+        fit = (
+            f"scale={frame_w}:{frame_h}:force_original_aspect_ratio=decrease,"
+            f"pad={frame_w}:{frame_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps:.3f},format=yuv420p"
+        )
+        for i, c in enumerate(clips):
+            m = media_map[c["media"]]
+            speed = float(c.get("speed", 1.0)) or 1.0
+            start, end = float(c["in"]), float(c["out"])
+            length = max(0.05, (end - start) / speed)
+            silence = f"anullsrc=r=48000:cl=stereo,atrim=duration={length:.3f},asetpts=PTS-STARTPTS[ca{i}]"
+            if m["type"] == "image":
+                inputs += ["-loop", "1", "-framerate", f"{fps:.3f}", "-t", f"{length:.3f}", "-i", str(m["path"])]
+                parts.append(f"[{n_inputs}:v]{fit}[cv{i}]")
+                parts.append(silence)
+            else:
+                inputs += ["-i", str(m["path"])]
+                parts.append(
+                    f"[{n_inputs}:v]trim=start={start:.3f}:end={end:.3f},"
+                    f"setpts=(PTS-STARTPTS)/{speed:.4f},{fit}[cv{i}]"
+                )
+                if m.get("has_audio"):
+                    chain = [f"atrim=start={start:.3f}:end={end:.3f}", "asetpts=PTS-STARTPTS", *_atempo_chain(speed)]
+                    volume = float(c.get("volume", 1.0))
+                    if abs(volume - 1.0) > 0.01:
+                        chain.append(f"volume={volume:.3f}")
+                    chain += ["aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=stereo"]
+                    parts.append(f"[{n_inputs}:a]{','.join(chain)}[ca{i}]")
+                else:
+                    parts.append(silence)
+            n_inputs += 1
+        pads = "".join(f"[cv{i}][ca{i}]" for i in range(len(clips)))
+        parts.append(f"{pads}concat=n={len(clips)}:v=1:a=1[vcut][acut]")
+        label, alabel, audio = "vcut", "acut", True
+    else:
+        inputs = ["-i", str(video_path)]
+        n_inputs = 1
 
-    # 2) hide logos / old burned-in subtitles
     for i, r in enumerate(regions or []):
         mode = r.get("mode", "blur")
         x = int(round(r["x"] * frame_w))
@@ -109,7 +173,7 @@ def prepare_base_video(video_path: Path, output_path: Path, keep_ranges=None, re
         w = max(8, int(round(r["w"] * frame_w)))
         h = max(8, int(round(r["h"] * frame_h)))
         if mode == "delogo":
-            x, y = max(1, x), max(1, y)  # delogo needs a 1px margin of real pixels
+            x, y = max(1, x), max(1, y)
             w, h = min(w, frame_w - 1 - x), min(h, frame_h - 1 - y)
         else:
             x, y = min(max(0, x), frame_w - 8), min(max(0, y), frame_h - 8)
@@ -130,7 +194,6 @@ def prepare_base_video(video_path: Path, output_path: Path, keep_ranges=None, re
             )
         label = nxt
 
-    # 3) anti-copy watermark (x, y = top-left corner as a fraction of the frame)
     if watermark and watermark.get("enabled"):
         opacity = min(max(float(watermark.get("opacity", 0.5)), 0.0), 1.0)
         x = int(round(float(watermark.get("x", 0.82)) * frame_w))
@@ -141,13 +204,13 @@ def prepare_base_video(video_path: Path, output_path: Path, keep_ranges=None, re
                 inputs += ["-i", str(image_path)]
                 scale = min(max(float(watermark.get("scale", 0.16)), 0.02), 1.0)
                 wm_w = max(8, int(round(scale * frame_w)))
-                parts.append(f"[1:v]scale={wm_w}:-1,format=rgba,colorchannelmixer=aa={opacity:.3f}[wm]")
+                parts.append(f"[{n_inputs}:v]scale={wm_w}:-1,format=rgba,colorchannelmixer=aa={opacity:.3f}[wm]")
                 parts.append(f"[{label}][wm]overlay=x={x}:y={y}[vwm]")
                 label = "vwm"
+                n_inputs += 1
         else:
             text = str(watermark.get("text", "")).strip()
             if text:
-                # font_size is in the editor's preview pixels; scale to the real frame
                 font_size = min(max(int(round(int(watermark.get("font_size", 24)) * size_unit)), 8), 800)
                 escaped = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\u2019")
                 parts.append(
@@ -156,7 +219,7 @@ def prepare_base_video(video_path: Path, output_path: Path, keep_ranges=None, re
                 )
                 label = "vwm"
 
-    if not parts:
+    if not parts or label == "0:v":
         return False
 
     maps = ["-map", f"[{label}]"]
@@ -261,14 +324,9 @@ _MONO_TO_STEREO = "aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0"   # dupl
 
 def mix_audio_track(video_path: Path, dub_path: Path, output_path: Path,
                     orig_volume: float = 0.25, dub_volume: float = 1.0,
-                    envelope_path: Path | None = None) -> None:
-    """Put the dubbed voice on the video, optionally keeping the original audio underneath.
-
-    orig_volume / dub_volume are 0..1 gains. envelope_path is an optional "ducking" control track
-    (mono wav whose samples are gains 0..1) multiplied into the original audio, so the original
-    gets quieter while the dubbed voice speaks. The video stream is copied, not re-encoded.
-    """
-    use_orig = orig_volume > 0.001 and has_audio(video_path)
+                    envelope_path: Path | None = None, full_ranges=None) -> None:
+    ranges = [(float(a), float(b)) for a, b in (full_ranges or []) if float(b) - float(a) > 0.01][:60]
+    use_orig = (orig_volume > 0.001 or bool(ranges)) and has_audio(video_path)
     if not use_orig:
         if abs(dub_volume - 1.0) < 0.01:
             replace_audio_track(video_path, dub_path, output_path, keep_original=False)
@@ -280,9 +338,14 @@ def mix_audio_track(video_path: Path, dub_path: Path, output_path: Path,
             orig_chain = f"aresample=48000,{_MONO_TO_STEREO}"
         else:
             orig_chain = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
-        dub_chain = f"aresample=48000,{_MONO_TO_STEREO}"   # dubbed track and envelope are mono files
+        dub_chain = f"aresample=48000,{_MONO_TO_STEREO}"
         inputs = ["-i", str(video_path), "-i", str(dub_path)]
-        parts = [f"[0:a]{orig_chain},volume={orig_volume:.3f}[o0]"]
+        if ranges:
+            cond = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in ranges)
+            vol = f"volume='if(gt({cond},0),1,{orig_volume:.3f})':eval=frame"
+        else:
+            vol = f"volume={orig_volume:.3f}"
+        parts = [f"[0:a]{orig_chain},{vol}[o0]"]
         last = "o0"
         if envelope_path:
             inputs += ["-i", str(envelope_path)]
@@ -290,7 +353,6 @@ def mix_audio_track(video_path: Path, dub_path: Path, output_path: Path,
             parts.append("[o0][env]amultiply[o1]")
             last = "o1"
         parts.append(f"[1:a]{dub_chain},volume={dub_volume:.3f}[d0]")
-        # amerge + pan sums the two stereo signals exactly (amix rescales levels), the limiter guards against clipping
         parts.append(f"[{last}][d0]amerge=inputs=2,pan=stereo|c0=c0+c2|c1=c1+c3,alimiter=limit=0.97[aout]")
         graph = ";".join(parts)
 

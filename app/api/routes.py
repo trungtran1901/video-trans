@@ -11,12 +11,63 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.config import UPLOAD_DIR, OUTPUT_DIR
 from app.core.llm_config import load_config, save_config, LLMConfig
 from app.core.llm_client import LLMClient
-from app.core import jobstore, dubbing, cuts as cutlib
-from app.core.pipeline import transcribe_and_translate, render_job
+from app.core import jobstore, dubbing, composition, media as media_lib
+from app.core.pipeline import transcribe_and_translate, render_job, prepare_media, translate_media
 
 router = APIRouter()
 
 MIN_SEGMENT_SECONDS = 0.05
+EDIT_STATES = ("review", "completed", "failed")
+
+
+def _ensure(job_id: str):
+    job = jobstore.get_job(job_id)
+    if job and job.status not in ("pending", "running"):
+        return composition.ensure_timeline(job_id) or job
+    return job
+
+
+def _editable(job_id: str):
+    job = _ensure(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.status not in EDIT_STATES:
+        raise HTTPException(status_code=400, detail="job is not in a state that allows editing")
+    return job
+
+
+def _comp_total(job) -> float:
+    if job.clips:
+        return composition.comp_duration(job.clips)
+    return float(job.total_duration or 0.0)
+
+
+def _media_playable(job_id: str, m: dict) -> Path:
+    if m.get("type") == "image":
+        return Path(m["path"])
+    if m["id"] == "main":
+        candidate = OUTPUT_DIR / job_id / "preview.mp4"
+    else:
+        candidate = Path(m["preview"]) if m.get("preview") else None
+    if candidate and candidate.exists():
+        return candidate
+    return Path(m["path"])
+
+
+def _media_out(job_id: str, m: dict) -> dict:
+    d = {k: v for k, v in m.items() if k not in ("segments", "path", "preview")}
+    segs = m.get("segments") or {}
+    d["source"] = segs.get("_source", [])
+    d["preview_ready"] = _media_playable(job_id, m).exists()
+    if m.get("tstate") == "done" and not m.get("merged"):
+        d["segments"] = {k: v for k, v in segs.items() if not k.startswith("_")}
+    return d
+
+
+def _public_job(job) -> dict:
+    d = dict(job.__dict__)
+    d["media"] = {mid: _media_out(job.id, m) for mid, m in (job.media or {}).items()}
+    return d
 
 
 @router.get("/api/llm/config")
@@ -89,6 +140,7 @@ async def create_job_endpoint(
         job_id=job_id,
         video_path=str(saved_path),
         context=context,
+        source_lang=source_lang,
     )
 
     thread = threading.Thread(
@@ -105,18 +157,18 @@ async def create_job_endpoint(
 def get_jobs():
     result = []
     for j in jobstore.list_jobs():
-        d = dict(j.__dict__)
-        d.pop("segments", None)  # list can be large; the editor loads segments separately
+        d = _public_job(j)
+        d.pop("segments", None)
         result.append(d)
     return result
 
 
 @router.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
-    job = jobstore.get_job(job_id)
+    job = _ensure(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    return job.__dict__
+    return _public_job(job)
 
 
 @router.delete("/api/jobs/{job_id}")
@@ -142,7 +194,7 @@ def delete_job_endpoint(job_id: str):
 
 @router.get("/api/jobs/{job_id}/segments")
 def get_segments(job_id: str):
-    job = jobstore.get_job(job_id)
+    job = _ensure(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     return job.segments
@@ -184,7 +236,7 @@ def update_segments(job_id: str, lang: str, payload: dict):
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="segments must be a list")
 
-    cleaned = _normalize_segments(items, job.total_duration)
+    cleaned = _normalize_segments(items, _comp_total(job))
     jobstore.set_segments_for_lang(job_id, lang, cleaned)
     return {"ok": True, "segments": cleaned}
 
@@ -324,32 +376,137 @@ def update_regions(job_id: str, payload: dict):
     return {"ok": True, "regions": cleaned}
 
 
-@router.put("/api/jobs/{job_id}/cuts")
-def update_cuts(job_id: str, payload: dict):
-    """Save the parts of the video to remove on export (source-timeline seconds)."""
-    job = jobstore.get_job(job_id)
+@router.get("/api/jobs/{job_id}/media")
+def list_media(job_id: str):
+    job = _ensure(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
-    if job.status not in ("review", "completed", "failed"):
-        raise HTTPException(status_code=400, detail="job is not in a state that allows editing")
-    items = payload.get("cuts", [])
-    if not isinstance(items, list):
-        raise HTTPException(status_code=400, detail="cuts must be a list")
+    return {mid: _media_out(job_id, m) for mid, m in (job.media or {}).items()}
 
-    cleaned = cutlib.normalize_cuts(items[:500], job.total_duration)
-    if job.total_duration and cleaned and not cutlib.keep_ranges(cleaned, job.total_duration):
-        raise HTTPException(status_code=400, detail="cannot cut the entire video")
-    jobstore.update_job(job_id, cuts=cleaned)
-    return {"ok": True, "cuts": cleaned}
+
+@router.post("/api/jobs/{job_id}/media")
+async def add_media(job_id: str, file: UploadFile = File(...), translate: str = Form("false")):
+    _editable(job_id)
+    ext = Path(file.filename or "").suffix.lower()
+    is_image = ext in composition.IMAGE_EXTS
+    if not ext:
+        ext = ".mp4"
+    mid = uuid.uuid4().hex[:8]
+    media_dir = OUTPUT_DIR / job_id / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    dest = media_dir / f"{mid}{ext}"
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    try:
+        width, height = media_lib.get_video_size(dest)
+        if is_image:
+            duration, has_audio = composition.MAX_IMAGE_SECONDS, False
+        else:
+            duration = media_lib.get_duration(dest)
+            has_audio = media_lib.has_audio(dest)
+            if duration <= 0:
+                raise ValueError("duration")
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Không đọc được tệp video/ảnh này")
+    wants = translate.strip().lower() in ("1", "true", "yes", "on")
+    entry = {
+        "id": mid,
+        "type": "image" if is_image else "video",
+        "name": Path(file.filename or mid).name[:80],
+        "path": str(dest),
+        "preview": "",
+        "duration": duration,
+        "width": width,
+        "height": height,
+        "has_audio": has_audio,
+        "translate": bool(wants and not is_image and has_audio),
+        "state": "preparing",
+        "tstate": "none",
+        "tmessage": "" if (is_image or has_audio or not wants) else "Clip không có âm thanh",
+        "error": "",
+        "segments": {},
+        "merged": False,
+    }
+    jobstore.add_media(job_id, entry)
+    threading.Thread(target=prepare_media, args=(job_id, mid), daemon=True).start()
+    return _media_out(job_id, entry)
+
+
+@router.put("/api/jobs/{job_id}/media/{mid}")
+def update_media_endpoint(job_id: str, mid: str, payload: dict):
+    job = _editable(job_id)
+    m = (job.media or {}).get(mid)
+    if not m:
+        raise HTTPException(status_code=404, detail="media not found")
+    if "translate" in payload and m["type"] == "video" and mid != "main":
+        want = bool(payload["translate"]) and bool(m.get("has_audio"))
+        jobstore.update_media(job_id, mid, translate=want)
+        if want and m.get("state") == "ready" and m.get("tstate") in ("none", "failed"):
+            jobstore.update_media(job_id, mid, tstate="running", tmessage="Đang chuẩn bị", error="")
+            threading.Thread(target=translate_media, args=(job_id, mid), daemon=True).start()
+    fresh = jobstore.get_job(job_id)
+    return _media_out(job_id, fresh.media[mid])
+
+
+@router.get("/api/jobs/{job_id}/media/{mid}/file")
+def media_file(job_id: str, mid: str, request: Request):
+    job = jobstore.get_job(job_id)
+    m = (job.media or {}).get(mid) if job else None
+    if not m:
+        raise HTTPException(status_code=404, detail="media not found")
+    path = _media_playable(job_id, m)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="file missing on disk")
+    if m["type"] == "image":
+        return FileResponse(str(path))
+    return _serve_with_range(path, request)
+
+
+@router.get("/api/jobs/{job_id}/media/{mid}/thumb")
+def media_thumb(job_id: str, mid: str):
+    job = jobstore.get_job(job_id)
+    m = (job.media or {}).get(mid) if job else None
+    if not m:
+        raise HTTPException(status_code=404, detail="media not found")
+    out_dir = OUTPUT_DIR / job_id
+    thumb = out_dir / "main_thumb.jpg" if mid == "main" else out_dir / "media" / f"{mid}_thumb.jpg"
+    if not thumb.exists():
+        try:
+            thumb.parent.mkdir(parents=True, exist_ok=True)
+            media_lib.make_thumbnail(_media_playable(job_id, m), thumb, is_image=m["type"] == "image")
+        except Exception:
+            raise HTTPException(status_code=404, detail="no thumbnail")
+    return FileResponse(str(thumb), media_type="image/jpeg", headers={"Cache-Control": "max-age=3600"})
+
+
+@router.put("/api/jobs/{job_id}/timeline")
+def update_timeline(job_id: str, payload: dict):
+    job = _editable(job_id)
+    items = payload.get("clips")
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="clips must be a list")
+    clips = composition.sanitize_clips(items, job.media or {})
+    if not clips or composition.comp_duration(clips) < 0.2:
+        raise HTTPException(status_code=400, detail="timeline is empty")
+    jobstore.update_job(job_id, clips=clips)
+    merged = payload.get("merged")
+    if isinstance(merged, list):
+        for mid in merged:
+            if str(mid) in (job.media or {}):
+                jobstore.update_media(job_id, str(mid), merged=True)
+    return {"ok": True, "clips": clips}
 
 
 @router.post("/api/jobs/{job_id}/export")
 def export_job(job_id: str):
-    job = jobstore.get_job(job_id)
+    job = _ensure(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status not in ("review", "completed", "failed"):
         raise HTTPException(status_code=400, detail=f"job is not ready to export (status={job.status})")
+    if any(m.get("state") == "preparing" or m.get("tstate") == "running" for m in (job.media or {}).values()):
+        raise HTTPException(status_code=400, detail="Clip mới đang được xử lý, hãy đợi xong rồi xuất.")
 
     # Set the status BEFORE starting the thread, otherwise the browser can poll,
     # still see "review" and reopen the editor instead of showing render progress.
@@ -508,7 +665,7 @@ def start_dub_preview(job_id: str, lang: str):
     sig = dubbing.segments_signature(segs, lang, voice)
     threading.Thread(
         target=_run_dub_preview,
-        args=(job_id, lang, segs, sig, job.total_duration, job.segments.get("_source"), voice),
+        args=(job_id, lang, segs, sig, _comp_total(job), job.segments.get("_source"), voice),
         daemon=True,
     ).start()
     return {"ok": True, "state": "running"}
@@ -549,7 +706,7 @@ def dub_preview_audio(job_id: str, lang: str, request: Request):
     return _serve_with_range(audio, request)
 
 
-VOICE_RE = re.compile(r"^(xtts|edge:[A-Za-z0-9\-]{3,80})$")
+VOICE_RE = re.compile(r"^(xtts|edge:[A-Za-z0-9\-]{3,80}|kokoro:[a-z_]{2,40})$")
 
 
 @router.get("/api/voices/{lang}")
