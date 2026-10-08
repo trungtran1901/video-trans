@@ -59,22 +59,25 @@ def transcribe_and_translate(job_id: str, video_path: Path, target_langs: list[s
 
         step_progress = 20
         step_size = max(1, int(70 / max(1, len(target_langs))))
+        failed_total, last_error = 0, ""
 
         for lang in target_langs:
             jobstore.update_job(job_id, progress=step_progress, message=f"Translating to {lang}")
-            translated_segments = translator.translate_all(client, segments, lang, context=context)
+            stats = {}
+            translated_segments = translator.translate_all(client, segments, lang, context=context, stats=stats)
+            failed_total += stats.get("failed", 0)
+            last_error = stats.get("error") or last_error
             jobstore.set_segments_for_lang(job_id, lang, translated_segments)
             step_progress += step_size
 
         jobstore.update_job(job_id, progress=88, message="Preparing preview")
         preview_thread.join()
 
-        jobstore.update_job(
-            job_id,
-            status="review",
-            progress=90,
-            message="Translation ready for review. Edit segments then export.",
-        )
+        message = "Translation ready for review. Edit segments then export."
+        if failed_total:
+            message = (f"Có {failed_total} đoạn CHƯA dịch được (lỗi AI: {last_error}). "
+                       f"Kiểm tra cấu hình LLM rồi bấm “Dịch lại”.")
+        jobstore.update_job(job_id, status="review", progress=90, message=message)
 
     except Exception as e:
         jobstore.update_job(job_id, status="failed", error=str(e), message="Failed")

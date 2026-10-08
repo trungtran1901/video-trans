@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Video Translator & Dubbing</title>
-<link rel="stylesheet" href="/static/style.css?v=13">
+<link rel="stylesheet" href="/static/style.css?v=14">
 </head>
 <body>
 <div class="app" id="app">
@@ -59,6 +59,14 @@
       <div class="editor-top">
         <h2>4. Chỉnh sửa phụ đề</h2>
         <div id="reviewTabs" class="chips"></div>
+        <div class="retr-box">
+          <select id="retrScope" class="sel" aria-label="Phạm vi dịch lại">
+            <option value="missing">Đoạn chưa dịch – ngôn ngữ này</option>
+            <option value="missing-all">Đoạn chưa dịch – mọi ngôn ngữ</option>
+            <option value="all">Dịch lại toàn bộ – ngôn ngữ này</option>
+          </select>
+          <button id="btnRetranslate" class="tool accent" type="button">Dịch lại</button>
+        </div>
       </div>
 
       <div class="editor-main">
@@ -370,6 +378,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=13"></script>
+<script src="/static/app.js?v=14"></script>
 </body>
 </html>

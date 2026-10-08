@@ -313,6 +313,13 @@ async function loadHistory() {
     right.appendChild(el("span", `status-badge status-${job.status}`, job.status));
 
     const busy = job.status === "running" || job.status === "rendering";
+
+    const bRe = el("button", "mini", "Dịch lại");
+    bRe.title = busy ? "Đang xử lý" : "Dịch lại các đoạn chưa dịch";
+    bRe.disabled = busy;
+    bRe.onclick = (e) => { e.stopPropagation(); rerunFromHistory(job); };
+    right.appendChild(bRe);
+
     const bDel = el("button", "mini danger", "Xóa");
     bDel.title = busy ? "Đang xử lý, không thể xóa" : "Xóa job này";
     bDel.disabled = busy;
@@ -1414,6 +1421,85 @@ $("btnExport").onclick = async () => {
 /* ------------------------------------------------------------------ */
 /* LLM settings modal                                                  */
 /* ------------------------------------------------------------------ */
+
+/* ---------- retranslate ---------- */
+
+async function postRetranslate(id, body) {
+  const res = await fetch(`/api/jobs/${id}/retranslate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = await res.text();
+    try { msg = JSON.parse(msg).detail || msg; } catch (e) { /* plain text */ }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+function retranslateSummary(out) {
+  const done = Object.values(out.results || {}).reduce((a, r) => a + r.translated, 0);
+  return out.failed
+    ? `Đã dịch lại ${done} đoạn, còn ${out.failed} đoạn lỗi (${out.error}). Có thể bấm “Dịch lại” lần nữa.`
+    : `Đã dịch lại ${done} đoạn.`;
+}
+
+async function reloadSegments(langs) {
+  const res = await fetch(`/api/jobs/${ed.jobId}/segments`);
+  if (!res.ok) return;
+  const all = await res.json();
+  pushTlUndo();                       // chụp trạng thái trước khi thay, để Hoàn tác được
+  langs.forEach((l) => {
+    if (all[l]) ed.data[l] = all[l].map((s) => ({ k: keySeq++, start: +s.start, end: +s.end, text: s.text || "" }));
+    ed.dirty.delete(l);
+  });
+  ed.selKey = null;
+  ed.activeKey = null;
+  renderAll();
+  refreshDubStatus();
+}
+
+$("btnRetranslate").onclick = async () => {
+  if (!ed.open) return;
+  const scope = $("retrScope").value;
+  if (scope === "all" && !confirm("Dịch lại TOÀN BỘ sẽ ghi đè cả những chỗ bạn đã sửa tay. Tiếp tục?")) return;
+  const btn = $("btnRetranslate");
+  btn.disabled = true;
+  try {
+    if (anyDirty() && !(await saveEditor())) return;   // server dịch từ bản đã lưu
+    setStatus("Đang dịch lại, vui lòng đợi...");
+    const body = scope === "missing-all" ? { all: false } : { langs: [ed.lang], all: scope === "all" };
+    const out = await postRetranslate(ed.jobId, body);
+    if (out.restarted) { closeEditor(); pollJob(); return; }
+    await reloadSegments(Object.keys(out.results || {}));
+    setStatus(retranslateSummary(out), !!out.failed);
+  } catch (e) {
+    setStatus("Dịch lại thất bại: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+async function rerunFromHistory(job) {
+  if (!confirm(`Dịch lại các đoạn chưa dịch của "${job.input_filename}"?`)) return;
+  currentJobId = job.id;
+  localStorage.setItem("vt_job", job.id);
+  closeEditor();
+  $("jobSection").style.display = "block";
+  $("resultSection").style.display = "none";
+  $("progressFill").style.width = "30%";
+  $("jobMessage").textContent = "Đang dịch lại, vui lòng đợi...";
+  try {
+    const out = await postRetranslate(job.id, { all: false });
+    if (out.restarted) { pollJob(); return; }
+    await openJob(job.id);
+    setStatus(retranslateSummary(out), !!out.failed);
+  } catch (e) {
+    $("jobMessage").textContent = "Lỗi: " + e.message;
+  }
+  loadHistory();
+}
 
 /* ---------- logo / old subtitle regions ---------- */
 

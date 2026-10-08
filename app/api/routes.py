@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.config import UPLOAD_DIR, OUTPUT_DIR
 from app.core.llm_config import load_config, save_config, LLMConfig
 from app.core.llm_client import LLMClient
-from app.core import jobstore, dubbing, composition, media as media_lib
+from app.core import jobstore, dubbing, composition, media as media_lib, translator, asr
 from app.core.pipeline import transcribe_and_translate, render_job, prepare_media, translate_media
 
 router = APIRouter()
@@ -778,3 +778,75 @@ def update_dub_settings(job_id: str, payload: dict):
         raise HTTPException(status_code=400, detail="invalid dub settings")
     jobstore.update_job(job_id, dub=dub)
     return {"ok": True, "dub": dub}
+
+
+# ---------------------------------------------------------------------------
+# Dịch lại: chạy lại bước dịch cho job đã tải lên (không chạy lại nhận diện giọng nói)
+# ---------------------------------------------------------------------------
+
+def _norm_text(t) -> str:
+    return " ".join(str(t or "").split()).lower()
+
+
+def _source_texts(job) -> set:
+    """Mọi câu gốc (video chính + clip thêm) – đoạn nào còn giống hệt câu gốc là chưa được dịch."""
+    texts = {_norm_text(s["text"]) for s in (job.segments or {}).get("_source", [])}
+    for m in (job.media or {}).values():
+        for s in (m.get("segments") or {}).get("_source", []):
+            texts.add(_norm_text(s.get("text")))
+    texts.discard("")
+    return texts
+
+
+@router.post("/api/jobs/{job_id}/retranslate")
+def retranslate(job_id: str, payload: dict | None = None):
+    """payload: {"langs": [..] | null (mọi ngôn ngữ), "all": false (true = dịch lại cả đoạn đã dịch)}"""
+    job = _editable(job_id)
+    payload = payload or {}
+
+    # Chưa có kết quả nhận diện (job lỗi từ sớm): chạy lại toàn bộ pipeline
+    if not (job.segments or {}).get("_source"):
+        if not job.video_path or not Path(job.video_path).exists():
+            raise HTTPException(status_code=400, detail="không còn file video gốc để xử lý lại")
+        jobstore.update_job(job_id, status="running", progress=5, message="Re-running", error="")
+        threading.Thread(
+            target=transcribe_and_translate,
+            args=(job_id, Path(job.video_path), job.target_langs, job.context, job.source_lang or None),
+            daemon=True,
+        ).start()
+        return {"ok": True, "restarted": True}
+
+    all_langs = [l for l in job.segments if not l.startswith("_")]
+    langs = payload.get("langs") or all_langs
+    if any(l not in all_langs for l in langs):
+        raise HTTPException(status_code=400, detail="unknown language")
+    only_missing = not bool(payload.get("all", False))
+
+    src = _source_texts(job)
+    client = LLMClient(load_config())
+    results, total_failed, last_error = {}, 0, ""
+
+    for lang in langs:
+        segs = [dict(s) for s in job.segments[lang]]
+        idxs = [i for i, s in enumerate(segs) if not only_missing or _norm_text(s["text"]) in src]
+        if not idxs:
+            results[lang] = {"translated": 0, "failed": 0}
+            continue
+        items = [asr.Segment(id=n, start=float(segs[i]["start"]), end=float(segs[i]["end"]),
+                             text=str(segs[i]["text"])) for n, i in enumerate(idxs)]
+        stats: dict = {}
+        out = translator.translate_all(client, items, lang, context=job.context, stats=stats)
+        failed = int(stats.get("failed", 0))
+        if failed >= len(idxs):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Không kết nối được mô hình AI ({lang}): {stats.get('error') or 'không rõ lỗi'}",
+            )
+        for n, i in enumerate(idxs):
+            segs[i]["text"] = out[n]["text"]
+        jobstore.set_segments_for_lang(job_id, lang, segs)
+        results[lang] = {"translated": len(idxs) - failed, "failed": failed}
+        total_failed += failed
+        last_error = stats.get("error") or last_error
+
+    return {"ok": True, "restarted": False, "results": results, "failed": total_failed, "error": last_error}

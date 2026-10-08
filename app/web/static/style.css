@@ -878,3 +878,8 @@ details.acc[open] > summary:hover { border-radius: 10px 10px 0 0; }
   .tl-track { height: 48px; }
   .r-main { height: 48px; }
 }
+
+/* ================= Retranslate ================= */
+.retr-box { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.retr-box .sel { width: auto; padding: 8px 10px; font-size: 13px; }
+@media (max-width: 640px) { .retr-box, .retr-box .sel, .retr-box .tool { width: 100%; } }
